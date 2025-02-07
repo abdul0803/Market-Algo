@@ -1,351 +1,154 @@
-## Disclaimer:This is an unfinished PineScript project for demonstration and educational purposes only. Use at your own discretion; this is not financial advice.
-
 //@version=6
-indicator("ICT QQQ Swing Trading - Calls & Puts (Pairing + Divergence Filter + Multi-Trade)", overlay=true, shorttitle="ICT QQQ Multi-Trades", max_boxes_count=500)
+indicator("Swing QQQ Predictions – Entry-Only with Trade IDs", overlay=true, shorttitle="Swing QQQ TradeIDs")
 
-// ───────────────────────────────
-// Color Settings for FVG and Visuals
-// ───────────────────────────────
-bullCss          = input.color(color.teal, "Bullish FVG Color")
-bullMitigatedCss = input.color(color.new(color.teal, 80), "Mitigated Bullish FVG")
-bearCss          = input.color(color.red, "Bearish FVG Color")
-bearMitigatedCss = input.color(color.new(color.red, 80), "Mitigated Bearish FVG")
+//──────────────────────────────
+// USER INPUT: Trade Type Filter
+//──────────────────────────────
+displayTradeType = input.string("All", title="Display Trade Type", options=["All", "High", "Medium", "Low"])
 
-// ───────────────────────────────
-// Filter Inputs
-// ───────────────────────────────
-enableHTFConfirmation  = input.bool(true, "Enable HTF Confirmation")
-htf_tf                 = input.timeframe("60", "HTF Timeframe")
-smaPeriodHTF           = input.int(50, "HTF SMA Period", minval=1)
+//──────────────────────────────
+// COMMON TECHNICAL ELEMENTS & INDICATORS
+//──────────────────────────────
 
-enableVolumeFilter     = input.bool(true, "Enable Smart Volume Filtering")
-volMultiplier          = input.float(1.5, "Volume Multiplier", step=0.1)
-avgVolumePeriod        = input.int(20, "Average Volume Period", minval=1)
+// Trend Filter: 50-period Simple Moving Average (SMA)
+sma50 = ta.sma(close, 50)
 
-enableDivergenceFilter = input.bool(true, "Enable RSI/OBV Divergence Filter")
-rsiPeriod              = input.int(14, "RSI Period", minval=1)
-rsiOverbought          = input.int(70, "RSI Overbought Level")
-rsiOversold            = input.int(30, "RSI Oversold Level")
+// Liquidity Sweep Detection:
+// Identify a swing low over the last 5 bars that is recent (within the last 10 bars)
+swingLow      = ta.lowest(low, 5) == low
+swingLowSince = ta.barssince(swingLow)
+liquiditySweepLow = swingLow and (swingLowSince < 10)
 
-enableVWAP             = input.bool(true, "Enable VWAP Confirmation")
-enableMarketStructure  = input.bool(true, "Enable Market Structure Breaks")
+// Fair Value Gap (FVG) Detection (Bullish Example):
+// Look for an imbalance where the low from 2 bars ago is above the current bar's high,
+// and the previous bar closed bullishly.
+var float fvgLowBull  = na
+var float fvgHighBull = na
+var bool  fvgActiveBull = false
+if low[2] > high[0] and close[2] > open[2]
+    fvgLowBull  := high[0]
+    fvgHighBull := low[2]
+    fvgActiveBull := true
+if fvgActiveBull and close <= fvgLowBull
+    fvgActiveBull := false
 
-// New inputs for early entry, Fibonacci target, trade frequency, and session filter
-earlySignalMargin    = input.float(0.5, "Early Signal Margin (%)", step=0.1)
-fibRatio             = input.float(1.27, "Fib Extension Ratio", step=0.01)
-minBarsBetweenTrades = input.int(10, "Min Bars Between Trades", minval=1)
-regSession           = input.session("0930-1600", "Regular Trading Session")  // U.S. regular hours
+// Bullish Pin Bar (PB) Detection:
+// A bullish pin bar has a long lower wick (over 60% of its range), suggesting a potential reversal.
+bullishPinBar = close > open and ((open - low) / (high - low) > 0.6)
 
-// NEW: Consolidation filter on 4H ATR
-consolidationATRThreshold = input.float(0.5, "ATR Consolidation Threshold (4H)", step=0.01)
+// Order Block (OB) Candidate & Retest:
+// Identify an order block candidate when the previous candle is bearish and
+// the current candle closes above that candle's high.
+var float OB_high = na
+var float OB_low  = na
+var int   OB_bar  = na
+obCandidate = (close[1] < open[1]) and (close > high[1])
+if obCandidate
+    OB_high := high[1]
+    OB_low  := low[1]
+    OB_bar  := bar_index[1]
+// OB Retest: Current low falls within the order block range.
+OB_retest = not na(OB_high) and (low >= OB_low) and (low <= OB_high)
 
-// NEW: Key Support Level for calls and tolerance
-keySupport         = input.float(510, "Key Support Level", step=0.1)
-supportTolerance   = input.float(5, "Support Tolerance", step=0.1)
+//──────────────────────────────
+// DEFINE TRADE TRIGGERS BASED ON SIGNAL COMBINATIONS
+//──────────────────────────────
 
-// Maximum hold period: 7 days in milliseconds
-maxHoldMS = 7 * 24 * 60 * 60 * 1000
+// --- LOW ACCURACY TRIGGERS (2 Triggers) ---
+lowTrigger1 = bullishPinBar                         // Pin Bar alone
+lowTrigger2 = liquiditySweepLow and bullishPinBar     // Liquidity Sweep + Pin Bar
 
-// ───────────────────────────────
-// 4H Divergence Filter (using a fast RSI on the 4H chart)
-// ───────────────────────────────
-fastRSI_period = input.int(7, "4H Fast RSI Period", minval=1)
-rsi4H = request.security(syminfo.tickerid, "240", ta.rsi(close, fastRSI_period))
-rsi4H_Bull = rsi4H < 30   // for call entries, oversold on 4H
-rsi4H_Bear = rsi4H > 70   // for put entries, overbought on 4H
+// --- MEDIUM ACCURACY TRIGGERS (3 Triggers) ---
+medTrigger1 = liquiditySweepLow and OB_retest         // Liquidity Sweep + OB Retest
+medTrigger2 = OB_retest and bullishPinBar             // OB Retest + Pin Bar
+medTrigger3 = fvgActiveBull and OB_retest             // FVG + OB Retest
 
-// Only allow entries during regular session
-isRegularSession = not na(time(timeframe.period, regSession))
+// --- HIGH ACCURACY TRIGGERS (2 Triggers) ---
+highTrigger1 = liquiditySweepLow and OB_retest and bullishPinBar  // Liquidity Sweep + OB Retest + Pin Bar
+highTrigger2 = fvgActiveBull and OB_retest and bullishPinBar        // FVG + OB Retest + Pin Bar
 
-// ───────────────────────────────
-// Higher Time Frame & ATR Filters
-// ───────────────────────────────
-// Daily trend filter (20-day SMA)
-dailySMA         = request.security(syminfo.tickerid, "D", ta.sma(close, 20))
-trendStrongBull  = close > dailySMA
-trendStrongBear  = close < dailySMA
+//──────────────────────────────
+// DETERMINE FINAL TRADE ACCURACY LEVEL
+// Priority: High > Medium > Low
+//──────────────────────────────
+var int tradeType = 0      // 0: no trade, 1: Low, 2: Medium, 3: High
+var string tradeLabel = "None"
+if (highTrigger1 or highTrigger2)
+    tradeType := 3
+    tradeLabel := "High"
+else if (medTrigger1 or medTrigger2 or medTrigger3)
+    tradeType := 2
+    tradeLabel := "Medium"
+else if (lowTrigger1 or lowTrigger2)
+    tradeType := 1
+    tradeLabel := "Low"
+else
+    tradeType := 0
 
-// 4H ATR-based consolidation filter
-atr4H          = request.security(syminfo.tickerid, "240", ta.atr(14))
-isConsolidating = atr4H < consolidationATRThreshold
+//──────────────────────────────
+// BUILD THE TRIGGER LOG STRING
+// Create a log of which trigger conditions were met (for debugging)
+//──────────────────────────────
+string myTriggerLog = ""
+if tradeType == 3
+    if highTrigger1 and not str.contains(myTriggerLog, "LS+OB+PB")
+        myTriggerLog += "LS+OB+PB, "
+    if highTrigger2 and not str.contains(myTriggerLog, "FVG+OB+PB")
+        myTriggerLog += "FVG+OB+PB, "
+else if tradeType == 2
+    if medTrigger1 and not str.contains(myTriggerLog, "LS+OB")
+        myTriggerLog += "LS+OB, "
+    if medTrigger2 and not str.contains(myTriggerLog, "OB+PB")
+        myTriggerLog += "OB+PB, "
+    if medTrigger3 and not str.contains(myTriggerLog, "FVG+OB")
+        myTriggerLog += "FVG+OB, "
+else if tradeType == 1
+    if lowTrigger1 and not str.contains(myTriggerLog, "PB")
+        myTriggerLog += "PB, "
+    if lowTrigger2 and not str.contains(myTriggerLog, "LS+PB")
+        myTriggerLog += "LS+PB, "
+if str.endswith(myTriggerLog, ", ")
+    myTriggerLog := str.substring(myTriggerLog, 0, str.length(myTriggerLog) - 2)
 
-// ───────────────────────────────
-// Standard Filters and Calculations
-// ───────────────────────────────
-// HTF Confirmation
-htfSMA       = enableHTFConfirmation ? request.security(syminfo.tickerid, htf_tf, ta.sma(close, smaPeriodHTF)) : na
-htfTrendBull = enableHTFConfirmation ? (close > htfSMA) : true
-htfTrendBear = enableHTFConfirmation ? (close < htfSMA) : true
+//──────────────────────────────
+// ASSIGN SWING TYPE BASED ON TRADE ACCURACY
+// High accuracy trades are considered "Long Swing"; Medium/Low as "Short Swing".
+///──────────────────────────────
+var string swingType = ""
+if tradeType == 3
+    swingType := "Long Swing"
+else if tradeType == 2 or tradeType == 1
+    swingType := "Short Swing"
+else
+    swingType := "None"
 
-// Smart Volume
-avgVolume    = enableVolumeFilter ? ta.sma(volume, avgVolumePeriod) : na
-volumeFilter = enableVolumeFilter ? (volume > avgVolume * volMultiplier) : true
+//──────────────────────────────
+// ENTRY LOGIC: Log BUY Signals on the Rising Edge of a Trade Signal
+// Only log when the trade signal is new (previous bar had no trade signal).
+//──────────────────────────────
+entrySignal = (tradeType > 0) and (nz(tradeType[1], 0) == 0)
+// Global counter for unique trade IDs.
+var int tradeCounter = 0
+if entrySignal and (displayTradeType == "All" or displayTradeType == tradeLabel)
+    tradeCounter += 1
+    label.new(bar_index, low, "Buy " + tradeLabel + " #" + str.tostring(tradeCounter) + " " + swingType + " @ " + str.tostring(close, "#.##") + " | Triggers:\n" + myTriggerLog, color=color.new(color.green, 80), textcolor=color.white, style=label.style_label_up, size=size.normal)
+    line.new(bar_index, close, bar_index + 5, close, color=color.green, width=2)
 
-// RSI & OBV Divergence (original)
-rsiValue         = enableDivergenceFilter ? ta.rsi(close, rsiPeriod) : na
-obvValue         = enableDivergenceFilter ? ta.cum(math.sign(close - close[1]) * volume) : na
-obvChange        = enableDivergenceFilter ? (obvValue - obvValue[1]) : na
-rsiDivergenceBull = enableDivergenceFilter and (rsiValue < rsiOversold) and (obvChange > 0)
-rsiDivergenceBear = enableDivergenceFilter and (rsiValue > rsiOverbought) and (obvChange < 0)
+//──────────────────────────────
+// VISUAL DEBUGGING: Plot Trigger Signals
+//──────────────────────────────
+plotshape(lowTrigger1, title="Low Trigger (Pin Bar)", location=location.belowbar, color=color.new(color.lime, 0), style=shape.arrowup, size=size.tiny)
+plotshape(lowTrigger2, title="Low Trigger (LS+Pin Bar)", location=location.belowbar, color=color.new(color.lime, 0), style=shape.arrowup, size=size.tiny)
 
-// Market Structure Breaks (Simple)
-msbBull = enableMarketStructure and (high > high[1]) and (low > low[1])
-msbBear = enableMarketStructure and (low < low[1]) and (high < high[1])
+plotshape(medTrigger1, title="Medium Trigger (LS+OB)", location=location.belowbar, color=color.new(color.yellow, 0), style=shape.triangleup, size=size.tiny)
+plotshape(medTrigger2, title="Medium Trigger (OB+Pin Bar)", location=location.belowbar, color=color.new(color.yellow, 0), style=shape.circle, size=size.tiny)
+plotshape(medTrigger3, title="Medium Trigger (FVG+OB)", location=location.belowbar, color=color.new(color.yellow, 0), style=shape.arrowup, size=size.tiny)
 
-// VWAP Confirmation
-vwap            = enableVWAP ? ta.sma(high + low + close, 3) / 3 : na
-vwapBullConfirm = enableVWAP and (close > vwap)
-vwapBearConfirm = enableVWAP and (close < vwap)
+plotshape(highTrigger1, title="High Trigger (LS+OB+Pin Bar)", location=location.belowbar, color=color.new(color.red, 0), style=shape.triangleup, size=size.tiny)
+plotshape(highTrigger2, title="High Trigger (FVG+OB+Pin Bar)", location=location.belowbar, color=color.new(color.red, 0), style=shape.circle, size=size.tiny)
 
-// Fair Value Gap (FVG) Detection
-bullFVG = (low > high[2]) and (close[1] > high[2])
-bearFVG = (high < low[2]) and (close[1] < low[2])
-
-// --- EARLY SIGNAL ADJUSTMENT ---
-// For bullish signals: trigger if bullFVG OR if close is within earlySignalMargin% above high[2].
-// For bearish signals: trigger if bearFVG OR if close is within earlySignalMargin% below low[2].
-earlyBull = bullFVG or (close <= high[2] * (1 + earlySignalMargin / 100))
-earlyBear = bearFVG or (close >= low[2] * (1 - earlySignalMargin / 100))
-
-// ───────────────────────────────
-// DAILY PIVOT LOW DETECTION ON DAILY CHART (Key support areas)
-// ───────────────────────────────
-dailyPivotLow = request.security(syminfo.tickerid, "D", ta.pivotlow(close, 5, 5))
-callSupportCondition = not na(dailyPivotLow) and math.abs(dailyPivotLow - keySupport) <= supportTolerance
-
-// ───────────────────────────────
-// For market structure exit, define a recent swing low (for calls)
-// (For puts, define a recent swing high; here we use a simple 10-day lowest low on the daily chart.)
-recentSwingLow = request.security(syminfo.tickerid, "D", ta.lowest(low, 10))
-
-// ───────────────────────────────
-// ARRAYS TO TRACK FVGs FOR VISUAL BOXES
-// ───────────────────────────────
-var array<float> bullFVGTop  = array.new_float()
-var array<float> bullFVGBot  = array.new_float()
-var array<int>   bullFVGStart = array.new_int()
-var array<float> bearFVGTop  = array.new_float()
-var array<float> bearFVGBot  = array.new_float()
-var array<int>   bearFVGStart = array.new_int()
-
-if bullFVG
-    array.push(bullFVGTop, high[2])
-    array.push(bullFVGBot, low)
-    array.push(bullFVGStart, bar_index)
-if bearFVG
-    array.push(bearFVGTop, high)
-    array.push(bearFVGBot, low[2])
-    array.push(bearFVGStart, bar_index)
-
-// ───────────────────────────────
-// DRAW AND EXTEND FVG BOXES UNTIL FILLED (Reverse iteration)
-// ───────────────────────────────
-var array<box> bullFVGBoxes = array.new_box()
-var int bullIdx = array.size(bullFVGTop) - 1
-while bullIdx >= 0
-    top      = array.get(bullFVGTop, bullIdx)
-    bot      = array.get(bullFVGBot, bullIdx)
-    startBar = array.get(bullFVGStart, bullIdx)
-    filled   = close < bot
-    colorFVG = filled ? bullMitigatedCss : bullCss
-    if bullIdx >= array.size(bullFVGBoxes)
-        array.push(bullFVGBoxes, box.new(left=startBar, right=bar_index, top=top, bottom=bot, bgcolor=colorFVG, extend=extend.right))
-    else
-        fvgBox = array.get(bullFVGBoxes, bullIdx)
-        fvgBox.set_right(bar_index)
-        fvgBox.set_bgcolor(colorFVG)
-    if filled
-        array.remove(bullFVGTop, bullIdx)
-        array.remove(bullFVGBot, bullIdx)
-        array.remove(bullFVGStart, bullIdx)
-        box.delete(array.get(bullFVGBoxes, bullIdx))
-        array.remove(bullFVGBoxes, bullIdx)
-    bullIdx := bullIdx - 1
-
-var array<box> bearFVGBoxes = array.new_box()
-var int bearIdx = array.size(bearFVGTop) - 1
-while bearIdx >= 0
-    top      = array.get(bearFVGTop, bearIdx)
-    bot      = array.get(bearFVGBot, bearIdx)
-    startBar = array.get(bearFVGStart, bearIdx)
-    filled   = close > top
-    colorFVG = filled ? bearMitigatedCss : bearCss
-    if bearIdx >= array.size(bearFVGBoxes)
-        array.push(bearFVGBoxes, box.new(left=startBar, right=bar_index, top=top, bottom=bot, bgcolor=colorFVG, extend=extend.right))
-    else
-        fvgBox = array.get(bearFVGBoxes, bearIdx)
-        fvgBox.set_right(bar_index)
-        fvgBox.set_bgcolor(colorFVG)
-    if filled
-        array.remove(bearFVGTop, bearIdx)
-        array.remove(bearFVGBot, bearIdx)
-        array.remove(bearFVGStart, bearIdx)
-        box.delete(array.get(bearFVGBoxes, bearIdx))
-        array.remove(bearFVGBoxes, bearIdx)
-    bearIdx := bearIdx - 1
-
-// ───────────────────────────────
-// OPTIMIZED SIGNAL CONDITIONS (Scores on one line)
-// ───────────────────────────────
-callScore = (htfTrendBull ? 1 : 0) + (volumeFilter ? 1 : 0) + (rsiDivergenceBull ? 1 : 0) + (msbBull ? 1 : 0) + (vwapBullConfirm ? 1 : 0)
-putScore  = (htfTrendBear ? 1 : 0) + (volumeFilter ? 1 : 0) + (rsiDivergenceBear ? 1 : 0) + (msbBear ? 1 : 0) + (vwapBearConfirm ? 1 : 0)
-
-// Original call signal based on our filters:
-origCallSignal = earlyBull and (callScore >= 3) and trendStrongBull and (not isConsolidating) and rsi4H_Bull
-// Final call signal: either the original criteria or a key-support condition.
-finalCallSignal = origCallSignal or callSupportCondition
-
-putSignal  = earlyBear and (putScore >= 3) and trendStrongBear and (not isConsolidating) and rsi4H_Bear
-
-// ───────────────────────────────
-// STATEFUL ENTRY/EXIT LOGIC WITH MULTI-TRADE MANAGEMENT
-// ───────────────────────────────
-// For calls: arrays to store active trade information
-var float[] activeCallEntryPrices = array.new_float()
-var int[]   activeCallEntryBars   = array.new_int()
-var int[]   activeCallEntryTimes  = array.new_int()
-
-// For puts:
-var float[] activePutEntryPrices = array.new_float()
-var int[]   activePutEntryBars   = array.new_int()
-var int[]   activePutEntryTimes  = array.new_int()
-
-// For closed trades (for pairing display)
-// Calls
-var float[] closedCallEntryPrices = array.new_float()
-var float[] closedCallExitPrices  = array.new_float()
-var int[]   closedCallEntryBars   = array.new_int()
-var int[]   closedCallExitBars    = array.new_int()
-var array<line> closedCallPairLines = array.new_line()
-// Puts
-var float[] closedPutEntryPrices = array.new_float()
-var float[] closedPutExitPrices  = array.new_float()
-var int[]   closedPutEntryBars   = array.new_int()
-var int[]   closedPutExitBars    = array.new_int()
-var array<line> closedPutPairLines = array.new_line()
-
-// ───────────────────────────────
-// Declare global variables for last entry bars
-var int lastCallEntryBar = na
-var int lastPutEntryBar  = na
-
-// ───────────────────────────────
-// ENTRY CONDITIONS
-// ───────────────────────────────
-buyCall = finalCallSignal and isRegularSession
-buyPut  = putSignal and isRegularSession
-
-// On a buy signal, add a new trade to the active arrays.
-if buyCall
-    array.push(activeCallEntryPrices, close)
-    array.push(activeCallEntryBars, bar_index)
-    array.push(activeCallEntryTimes, time)
-if buyPut
-    array.push(activePutEntryPrices, close)
-    array.push(activePutEntryBars, bar_index)
-    array.push(activePutEntryTimes, time)
-
-// ───────────────────────────────
-// UPDATE TRADE STATE AND DEFINE EXIT SIGNALS
-// ───────────────────────────────
-var bool inCall = array.size(activeCallEntryPrices) > 0
-var bool inPut  = array.size(activePutEntryPrices)  > 0
-
-if buyCall
-    lastCallEntryBar := bar_index
-if buyPut
-    lastPutEntryBar := bar_index
-
-// Define exit signals for active trades:
-sellCall = inCall and not finalCallSignal
-sellPut  = inPut and not putSignal
-
-// ───────────────────────────────
-// EXIT CONDITIONS FOR ACTIVE CALL TRADES
-// ───────────────────────────────
-var int j = array.size(activeCallEntryPrices) - 1
-while j >= 0
-    entryTime = array.get(activeCallEntryTimes, j)
-    tradeDuration = time - entryTime
-    marketStructureBroken = close < recentSwingLow
-    exitCondition = marketStructureBroken or (tradeDuration >= maxHoldMS)
-    if exitCondition
-        entryPrice = array.get(activeCallEntryPrices, j)
-        entryBar   = array.get(activeCallEntryBars, j)
-        array.push(closedCallEntryPrices, entryPrice)
-        array.push(closedCallEntryBars, entryBar)
-        array.push(closedCallExitPrices, close)
-        array.push(closedCallExitBars, bar_index)
-        callPairLine = line.new(entryBar, entryPrice, bar_index, close, color=color.green, style=line.style_solid, width=2)
-        array.push(closedCallPairLines, callPairLine)
-        array.remove(activeCallEntryPrices, j)
-        array.remove(activeCallEntryBars, j)
-        array.remove(activeCallEntryTimes, j)
-    j := j - 1
-
-// ───────────────────────────────
-// EXIT CONDITIONS FOR ACTIVE PUT TRADES
-// ───────────────────────────────
-var int k = array.size(activePutEntryPrices) - 1
-while k >= 0
-    entryTime = array.get(activePutEntryTimes, k)
-    tradeDuration = time - entryTime
-    recentSwingHigh = request.security(syminfo.tickerid, "D", ta.highest(high, 10))
-    marketStructureBroken = close > recentSwingHigh
-    exitCondition = marketStructureBroken or (tradeDuration >= maxHoldMS)
-    if exitCondition
-        entryPrice = array.get(activePutEntryPrices, k)
-        entryBar   = array.get(activePutEntryBars, k)
-        array.push(closedPutEntryPrices, entryPrice)
-        array.push(closedPutEntryBars, entryBar)
-        array.push(closedPutExitPrices, close)
-        array.push(closedPutExitBars, bar_index)
-        putPairLine = line.new(entryBar, entryPrice, bar_index, close, color=color.red, style=line.style_solid, width=2)
-        array.push(closedPutPairLines, putPairLine)
-        array.remove(activePutEntryPrices, k)
-        array.remove(activePutEntryBars, k)
-        array.remove(activePutEntryTimes, k)
-    k := k - 1
-
-// ───────────────────────────────
-// FIB TARGET CALCULATION & PLOTTING
-// ───────────────────────────────
-var float callTargetPrice = na
-var line callTargetLine   = na
-if buyCall
-    if bullFVG
-        callTargetPrice := close + ((high[2] - low) * fibRatio)
-        callTargetLine := line.new(bar_index, callTargetPrice, bar_index + 10, callTargetPrice, color=color.green, style=line.style_dotted)
-if not buyCall and not na(callTargetLine)
-    line.delete(callTargetLine)
-    callTargetLine := na
-
-var float putTargetPrice = na
-var line putTargetLine   = na
-if buyPut
-    if bearFVG
-        putTargetPrice := close - ((high - low[2]) * fibRatio)
-        putTargetLine := line.new(bar_index, putTargetPrice, bar_index + 10, putTargetPrice, color=color.red, style=line.style_dotted)
-if not buyPut and not na(putTargetLine)
-    line.delete(putTargetLine)
-    putTargetLine := na
-
-// ───────────────────────────────
-// VISUAL LABELS FOR ENTRY/EXIT EVENTS
-// ───────────────────────────────
-if buyCall
-    label.new(bar_index, low, "Buy Call $" + str.tostring(close, "#.##"), color=color.green, style=label.style_label_up, textcolor=color.white)
-if buyPut
-    label.new(bar_index, high, "Buy Put $" + str.tostring(close, "#.##"), color=color.green, style=label.style_label_down, textcolor=color.white)
-if sellCall
-    label.new(bar_index, high, "Sell Call $" + str.tostring(close, "#.##"), color=color.red, style=label.style_label_down, textcolor=color.white)
-if sellPut
-    label.new(bar_index, low, "Sell Put $" + str.tostring(close, "#.##"), color=color.red, style=label.style_label_up, textcolor=color.white)
-
-// ───────────────────────────────
-// ALERT CONDITIONS (static messages)
-// ───────────────────────────────
-alertcondition(buyCall, title="Buy Call", message="Buy Call signal detected")
-alertcondition(sellCall, title="Sell Call", message="Sell Call signal detected")
-alertcondition(buyPut, title="Buy Put", message="Buy Put signal detected")
-alertcondition(sellPut, title="Sell Put", message="Sell Put signal detected")
+//──────────────────────────────
+// PLOT TREND INDICATOR
+//──────────────────────────────
+plot(sma50, title="50 SMA", color=color.blue)
+plot(na, title="Dummy")
